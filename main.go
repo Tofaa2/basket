@@ -13,67 +13,25 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
-// Priority levels
-type Priority int
-
-const (
-	PriorityLowest Priority = iota
-	PriorityLow
-	PriorityMedium
-	PriorityHigh
-	PriorityHighest
-)
-
-func (p Priority) String() string {
-	switch p {
-	case PriorityLowest:
-		return "LOWEST"
-	case PriorityLow:
-		return "LOW"
-	case PriorityMedium:
-		return "MEDIUM"
-	case PriorityHigh:
-		return "HIGH"
-	case PriorityHighest:
-		return "HIGHEST"
-	default:
-		return "MEDIUM"
-	}
-}
-
-func (p Priority) Color() lipgloss.Color {
-	switch p {
-	case PriorityLowest:
-		return lipgloss.Color("#6B7280")
-	case PriorityLow:
-		return lipgloss.Color("#3B82F6")
-	case PriorityMedium:
-		return lipgloss.Color("#8B5CF6")
-	case PriorityHigh:
-		return lipgloss.Color("#F59E0B")
-	case PriorityHighest:
-		return lipgloss.Color("#EF4444")
-	default:
-		return lipgloss.Color("#8B5CF6")
-	}
-}
-
-// Task represents a single task
 type Task struct {
 	ID          string    `json:"id"`
 	Title       string    `json:"title"`
 	Description string    `json:"description"`
 	Completed   bool      `json:"completed"`
-	Priority    Priority  `json:"priority"`
+	Column      string    `json:"column"`
+	Labels      []string  `json:"labels"`
 	CreatedAt   time.Time `json:"created_at"`
 }
 
-// TaskList holds tasks
-type TaskList struct {
-	Tasks []Task `json:"tasks"`
+type BoardConfig struct {
+	Columns []string `json:"columns"`
 }
 
-// ViewMode represents the current view
+type TaskList struct {
+	Tasks  []Task      `json:"tasks"`
+	Config BoardConfig `json:"config"`
+}
+
 type ViewMode int
 
 const (
@@ -83,713 +41,399 @@ const (
 	ViewHelp
 )
 
-type model struct {
-	tasks           []Task
-	globalTasks     []Task
-	localTasks      []Task
-	selectedCol     int // which priority column
-	selectedTask    int // which task in that column
-	scrollOffset    int // scroll offset for tasks in column
-	colScrollOffset int // horizontal scroll offset for columns
-	mode            ViewMode
-	showingLocal    bool
-	textarea        textarea.Model
-	editingTask     *Task
-	width           int
-	height          int
-	globalPath      string
-	localPath       string
-	hasLocal        bool
-}
 
 var (
 	headerStyle = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(lipgloss.Color("#FBBF24")).
-			Background(lipgloss.Color("#1F2937")).
-			Padding(0, 2)
+		Bold(true).
+		Foreground(lipgloss.Color("#FBBF24")).
+		Background(lipgloss.Color("#1F2937")).
+		Padding(0, 2)
 
-	columnStyle = lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			Padding(1, 2).
-			Width(30).
-			Height(20)
+	columnBase = lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		Padding(1, 1).
+		Width(28).
+		Height(18)
 
-	selectedColumnStyle = lipgloss.NewStyle().
-				Border(lipgloss.RoundedBorder()).
-				BorderForeground(lipgloss.Color("#FBBF24")).
-				Padding(1, 2).
-				Width(30).
-				Height(20)
+	selectedColumn = columnBase.Copy().
+		BorderForeground(lipgloss.Color("#FBBF24"))
 
-	taskCardStyle = lipgloss.NewStyle().
-			Border(lipgloss.NormalBorder()).
-			Padding(0, 1).
-			MarginBottom(1)
+	taskStyle = lipgloss.NewStyle().
+		Border(lipgloss.NormalBorder()).
+		Padding(0, 1).
+		MarginBottom(1)
 
-	selectedTaskStyle = lipgloss.NewStyle().
-				Border(lipgloss.ThickBorder()).
-				BorderForeground(lipgloss.Color("#FBBF24")).
-				Padding(0, 1).
-				MarginBottom(1).
-				Bold(true)
+	selectedTask = taskStyle.Copy().
+		Border(lipgloss.ThickBorder()).
+		BorderForeground(lipgloss.Color("#FBBF24")).
+		Bold(true)
 
-	completedTaskStyle = lipgloss.NewStyle().
-				Border(lipgloss.NormalBorder()).
-				Padding(0, 1).
-				MarginBottom(1).
-				Foreground(lipgloss.Color("#6B7280")).
-				Strikethrough(true)
-
-	helpStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#9CA3AF"))
-
-	titleStyle = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(lipgloss.Color("#FBBF24")).
-			Background(lipgloss.Color("#1F2937")).
-			Padding(0, 2).
-			MarginBottom(1)
+	completedTask = taskStyle.Copy().
+		Foreground(lipgloss.Color("#6B7280")).
+		Strikethrough(true)
 )
 
-func getGlobalTasksPath() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "basket-tasks.json"
-	}
-	return filepath.Join(home, "basket-tasks.json")
-}
-
-func getLocalTasksPath() (string, bool) {
-	cwd, err := os.Getwd()
-	if err != nil {
-		return "", false
-	}
-	path := filepath.Join(cwd, ".basket.json")
-	if _, err := os.Stat(path); err == nil {
-		return path, true
-	}
-	return path, false
-}
-
-func loadTasks(path string) ([]Task, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return []Task{}, nil
-		}
-		return nil, err
-	}
-
-	var taskList TaskList
-	if err := json.Unmarshal(data, &taskList); err != nil {
-		return nil, err
-	}
-	return taskList.Tasks, nil
-}
-
-func saveTasks(path string, tasks []Task) error {
-	taskList := TaskList{Tasks: tasks}
-	data, err := json.MarshalIndent(taskList, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(path, data, 0644)
-}
-
-func generateID() string {
-	return fmt.Sprintf("%d", time.Now().UnixNano())
-}
-
-func initialModel() model {
-	ta := textarea.New()
-	ta.Placeholder = "Enter task title..."
-	ta.Focus()
-	ta.CharLimit = 500
-	ta.SetWidth(60)
-	ta.SetHeight(3)
-
-	globalPath := getGlobalTasksPath()
-	localPath, hasLocal := getLocalTasksPath()
-
-	globalTasks, _ := loadTasks(globalPath)
-	var localTasks []Task
-	if hasLocal {
-		localTasks, _ = loadTasks(localPath)
-	}
-
-	tasks := localTasks
-	showingLocal := true
-
-	if !hasLocal || len(localTasks) == 0 {
-		tasks = globalTasks
-		showingLocal = false
-		if !hasLocal {
-			localTasks = []Task{}
-		}
-	}
-
-	return model{
-		tasks:        tasks,
-		globalTasks:  globalTasks,
-		localTasks:   localTasks,
-		mode:         ViewBoard,
-		showingLocal: showingLocal,
-		textarea:     ta,
-		globalPath:   globalPath,
-		localPath:    localPath,
-		hasLocal:     hasLocal,
-		selectedCol:  2, // Start at MEDIUM
-	}
-}
-
-func (m model) Init() tea.Cmd {
-	return nil
-}
-
-func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	switch msg := msg.(type) {
-	case tea.WindowSizeMsg:
-		m.width = msg.Width
-		m.height = msg.Height
-		return m, nil
-
-	case tea.KeyMsg:
-		switch m.mode {
-		case ViewBoard:
-			return m.updateBoard(msg)
-		case ViewAdd:
-			return m.updateAdd(msg)
-		case ViewEdit:
-			return m.updateEdit(msg)
-		case ViewHelp:
-			if msg.String() == "esc" || msg.String() == "q" {
-				m.mode = ViewBoard
-			}
-			return m, nil
-		}
-	}
-
-	return m, nil
-}
-
-func (m model) updateBoard(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
-	case "ctrl+c", "q":
-		return m, tea.Quit
-
-	case "left", "h":
-		if m.selectedCol > 0 {
-			m.selectedCol--
-		} else {
-			m.selectedCol = 4
-		}
-		tasksInNewCol := m.getTasksInColumn(Priority(m.selectedCol))
-		if len(tasksInNewCol) == 0 {
-			m.selectedTask = 0
-		} else if m.selectedTask >= len(tasksInNewCol) {
-			m.selectedTask = len(tasksInNewCol) - 1
-		}
-		m.updateHorizontalScroll()
-
-	case "right", "l":
-		if m.selectedCol < 4 {
-			m.selectedCol++
-		} else {
-			m.selectedCol = 0
-		}
-		tasksInNewCol := m.getTasksInColumn(Priority(m.selectedCol))
-		if len(tasksInNewCol) == 0 {
-			m.selectedTask = 0
-		} else if m.selectedTask >= len(tasksInNewCol) {
-			m.selectedTask = len(tasksInNewCol) - 1
-		}
-		m.updateHorizontalScroll()
-
-	case "up", "k":
-		tasksInCol := m.getTasksInColumn(Priority(m.selectedCol))
-		if m.selectedTask > 0 && len(tasksInCol) > 0 {
-			m.selectedTask--
-			// Scroll up if needed
-			if m.selectedTask < m.scrollOffset {
-				m.scrollOffset = m.selectedTask
-			}
-		}
-
-	case "down", "j":
-		tasksInCol := m.getTasksInColumn(Priority(m.selectedCol))
-		if len(tasksInCol) > 0 && m.selectedTask < len(tasksInCol)-1 {
-			m.selectedTask++
-			maxVisible := 8
-			if m.selectedTask >= m.scrollOffset+maxVisible {
-				m.scrollOffset = m.selectedTask - maxVisible + 1
-			}
-		}
-
-	case " ", "enter":
-		tasksInCol := m.getTasksInColumn(Priority(m.selectedCol))
-		if len(tasksInCol) > 0 && m.selectedTask < len(tasksInCol) {
-			for i := range m.tasks {
-				if m.tasks[i].ID == tasksInCol[m.selectedTask].ID {
-					m.tasks[i].Completed = !m.tasks[i].Completed
-					m.saveCurrent()
-					break
-				}
-			}
-		}
-
-	case "n":
-		m.mode = ViewAdd
-		m.textarea.Reset()
-		m.textarea.Placeholder = "Enter task title..."
-		m.textarea.SetHeight(3)
-		return m, m.textarea.Focus()
-
-	case "e":
-		tasksInCol := m.getTasksInColumn(Priority(m.selectedCol))
-		if len(tasksInCol) > 0 && m.selectedTask < len(tasksInCol) {
-			for i := range m.tasks {
-				if m.tasks[i].ID == tasksInCol[m.selectedTask].ID {
-					m.mode = ViewEdit
-					m.editingTask = &m.tasks[i]
-					m.textarea.SetValue(m.editingTask.Description)
-					m.textarea.Placeholder = "Enter task description..."
-					m.textarea.SetHeight(10)
-					return m, m.textarea.Focus()
-				}
-			}
-		}
-
-	case "d":
-		tasksInCol := m.getTasksInColumn(Priority(m.selectedCol))
-		if len(tasksInCol) > 0 && m.selectedTask < len(tasksInCol) {
-			taskID := tasksInCol[m.selectedTask].ID
-			for i := range m.tasks {
-				if m.tasks[i].ID == taskID {
-					m.tasks = append(m.tasks[:i], m.tasks[i+1:]...)
-					if m.selectedTask >= len(m.getTasksInColumn(Priority(m.selectedCol))) && m.selectedTask > 0 {
-						m.selectedTask--
-					}
-					m.saveCurrent()
-					break
-				}
-			}
-		}
-
-	case "m":
-		tasksInCol := m.getTasksInColumn(Priority(m.selectedCol))
-		if len(tasksInCol) > 0 && m.selectedTask < len(tasksInCol) {
-			for i := range m.tasks {
-				if m.tasks[i].ID == tasksInCol[m.selectedTask].ID {
-					newPriority := (m.tasks[i].Priority + 1) % 5
-					m.tasks[i].Priority = newPriority
-					m.saveCurrent()
-
-					m.selectedCol = int(newPriority)
-					tasksInNewCol := m.getTasksInColumn(newPriority)
-					for idx, task := range tasksInNewCol {
-						if task.ID == m.tasks[i].ID {
-							m.selectedTask = idx
-							break
-						}
-					}
-					break
-				}
-			}
-		}
-
-	case "t":
-		if m.hasLocal {
-			m.showingLocal = !m.showingLocal
-			if m.showingLocal {
-				m.tasks = m.localTasks
-			} else {
-				m.tasks = m.globalTasks
-			}
-			// Reset position
-			m.selectedCol = 2
-			m.selectedTask = 0
-			m.scrollOffset = 0
-			m.colScrollOffset = 0
-			m.updateHorizontalScroll()
-		} else {
-			// If no local file exists, create it by switching to local mode
-			m.showingLocal = true
-			m.hasLocal = true
-			m.localTasks = []Task{}
-			m.tasks = m.localTasks
-			m.selectedCol = 2
-			m.selectedTask = 0
-			m.scrollOffset = 0
-			m.colScrollOffset = 0
-			m.updateHorizontalScroll()
-		}
-
-	case "?":
-		m.mode = ViewHelp
-	}
-
-	return m, nil
-}
-
-func (m model) updateAdd(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	var cmd tea.Cmd
-
-	switch msg.String() {
-	case "esc":
-		m.mode = ViewBoard
-		return m, nil
-
-	case "ctrl+s":
-		title := strings.TrimSpace(m.textarea.Value())
-		if title != "" {
-			newTask := Task{
-				ID:        generateID(),
-				Title:     title,
-				Priority:  Priority(m.selectedCol),
-				CreatedAt: time.Now(),
-			}
-			m.tasks = append(m.tasks, newTask)
-			m.saveCurrent()
-		}
-		m.mode = ViewBoard
-		return m, nil
-	}
-
-	m.textarea, cmd = m.textarea.Update(msg)
-	return m, cmd
-}
-
-func (m model) updateEdit(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	var cmd tea.Cmd
-
-	switch msg.String() {
-	case "esc":
-		m.mode = ViewBoard
-		m.editingTask = nil
-		return m, nil
-
-	case "ctrl+s":
-		if m.editingTask != nil {
-			m.editingTask.Description = strings.TrimSpace(m.textarea.Value())
-			m.saveCurrent()
-		}
-		m.mode = ViewBoard
-		m.editingTask = nil
-		return m, nil
-	}
-
-	m.textarea, cmd = m.textarea.Update(msg)
-	return m, cmd
-}
-
-func (m *model) saveCurrent() {
-	if m.showingLocal {
-		m.localTasks = make([]Task, len(m.tasks))
-		copy(m.localTasks, m.tasks)
-		if !m.hasLocal {
-			m.hasLocal = true
-		}
-		saveTasks(m.localPath, m.localTasks)
-	} else {
-		m.globalTasks = make([]Task, len(m.tasks))
-		copy(m.globalTasks, m.tasks)
-		saveTasks(m.globalPath, m.globalTasks)
-	}
-}
-
-func (m model) getTasksInColumn(priority Priority) []Task {
-	var tasks []Task
-	for _, task := range m.tasks {
-		if task.Priority == priority {
-			tasks = append(tasks, task)
-		}
-	}
-	return tasks
-}
-
-func (m *model) updateHorizontalScroll() {
-	visibleCols := 3
-
-	desiredScroll := m.selectedCol - (visibleCols / 2)
-
-	if desiredScroll < 0 {
-		m.colScrollOffset = 0
-	} else if desiredScroll > 5-visibleCols {
-		m.colScrollOffset = 5 - visibleCols
-	} else {
-		m.colScrollOffset = desiredScroll
-	}
-}
-
-func (m model) getVisibleColumns() (int, int) {
-	if m.width >= 160 {
-		return 0, 5
-	} else if m.width >= 128 {
-		start := m.colScrollOffset
-		if start > 1 {
-			start = 1
-		}
-		return start, start + 4
-	} else {
-		start := m.colScrollOffset
-		if start > 2 {
-			start = 2
-		}
-		return start, start + 3
+// assign colors to columns dynamically
+func colColor(name string) lipgloss.Color {
+	switch name {
+	case "todo":
+		return "#3B82F6"
+	case "doing":
+		return "#F59E0B"
+	case "done":
+		return "#10B981"
+	case "bug":
+		return "#EF4444"
+	case "feature":
+		return "#8B5CF6"
+	case "refactor":
+		return "#EC4899"
+	default:
+		return "#9CA3AF"
 	}
 }
 
 func (m model) View() string {
-	switch m.mode {
-	case ViewAdd:
-		return m.viewAdd()
-	case ViewEdit:
-		return m.viewEdit()
-	case ViewHelp:
-		return m.viewHelp()
-	default:
-		return m.viewBoard()
+	if m.mode == ViewAdd {
+		return headerStyle.Render(" ADD TASK ") + "\n\n" +
+			m.textarea.View() +
+			"\n\nenter = save • esc = cancel"
 	}
+
+	if m.mode == ViewEdit {
+		return headerStyle.Render(" EDIT TASK ") + "\n\n" +
+			m.textarea.View() +
+			"\n\nenter = save • esc = cancel"
+	}
+
+	var cols []string
+
+	for i, col := range m.columns {
+		cols = append(cols, m.renderColumn(col, i))
+	}
+
+	header := headerStyle.Render("  🧺 BASKET  ")
+
+	footer := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#9CA3AF")).
+		Render("h/l move • j/k select • n new • e edit • d delete • m move • space done • q quit")
+
+	return header + "\n\n" +
+		lipgloss.JoinHorizontal(lipgloss.Top, cols...) +
+		"\n\n" + footer
 }
 
-func (m model) viewBoard() string {
-	var b strings.Builder
+func (m model) renderColumn(col string, index int) string {
+	color := colColor(col)
+	tasks := m.getTasks(col)
 
-	// Header
-	source := "🌍 GLOBAL"
-	if m.showingLocal {
-		source = "📂 LOCAL"
-	}
-	header := headerStyle.Render(fmt.Sprintf("  🧺 BASKET  %s  ", source))
-	b.WriteString(header + "\n\n")
-
-	startCol, endCol := m.getVisibleColumns()
-	priorities := []Priority{PriorityLowest, PriorityLow, PriorityMedium, PriorityHigh, PriorityHighest}
-
-	var visibleColumns []string
-	for i := startCol; i < endCol && i < 5; i++ {
-		priority := priorities[i]
-		column := m.renderColumn(priority, i == m.selectedCol)
-		visibleColumns = append(visibleColumns, column)
-	}
-
-	var columnsWithIndicators []string
-
-	if startCol > 0 {
-		leftIndicator := lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#FBBF24")).
-			Bold(true).
-			Render("◀")
-		columnsWithIndicators = append(columnsWithIndicators, leftIndicator)
-	}
-
-	columnsWithIndicators = append(columnsWithIndicators, visibleColumns...)
-
-	if endCol < 5 {
-		rightIndicator := lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#FBBF24")).
-			Bold(true).
-			Render("▶")
-		columnsWithIndicators = append(columnsWithIndicators, rightIndicator)
-	}
-
-	columnsJoined := lipgloss.JoinHorizontal(lipgloss.Top, columnsWithIndicators...)
-	b.WriteString(columnsJoined + "\n\n")
-
-	help := helpStyle.Render("h/l columns • j/k tasks • space toggle • m move • n new • e edit • d delete • t switch • ? help • q quit")
-	b.WriteString(help)
-
-	return b.String()
-}
-
-func (m model) renderColumn(priority Priority, isSelected bool) string {
-	var b strings.Builder
-
-	headerText := priority.String()
-	if isSelected {
-		headerText = "▶ " + headerText + " ◀"
-	}
-	colHeader := lipgloss.NewStyle().
+	title := lipgloss.NewStyle().
 		Bold(true).
-		Foreground(priority.Color()).
-		Width(26).
+		Foreground(color).
 		Align(lipgloss.Center).
-		Render(headerText)
+		Width(24).
+		Render(strings.ToUpper(col))
 
-	b.WriteString(colHeader + "\n")
+	var items []string
 
-	separator := strings.Repeat("─", 26)
-	if isSelected {
-		separator = strings.Repeat("═", 26)
-	}
-	sepStyle := lipgloss.NewStyle()
-	if isSelected {
-		sepStyle = sepStyle.Foreground(priority.Color())
-	}
-	b.WriteString(sepStyle.Render(separator) + "\n\n")
-
-	tasks := m.getTasksInColumn(priority)
-
-	if len(tasks) == 0 {
-		emptyText := lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#4B5563")).
-			Italic(true).
-			Render("No tasks")
-		b.WriteString(emptyText + "\n")
-	} else {
-		maxVisible := 8
-		start := 0
-		end := len(tasks)
-
-		if isSelected {
-			start = m.scrollOffset
-			end = m.scrollOffset + maxVisible
-			if end > len(tasks) {
-				end = len(tasks)
-			}
-		}
-
-		if isSelected && start > 0 {
-			indicator := lipgloss.NewStyle().
-				Foreground(lipgloss.Color("#9CA3AF")).
-				Render("    ▲ more above")
-			b.WriteString(indicator + "\n")
-		}
-
-		for i := start; i < end; i++ {
-			task := tasks[i]
-			isTaskSelected := isSelected && i == m.selectedTask
-			b.WriteString(m.renderTask(task, isTaskSelected) + "\n")
-		}
-
-		if isSelected && end < len(tasks) {
-			indicator := lipgloss.NewStyle().
-				Foreground(lipgloss.Color("#9CA3AF")).
-				Render("    ▼ more below")
-			b.WriteString(indicator + "\n")
-		}
+	for i, t := range tasks {
+		items = append(items, m.renderTask(t, index == m.selectedCol && i == m.selectedTask))
 	}
 
-	content := b.String()
-
-	style := columnStyle
-	if isSelected {
-		style = selectedColumnStyle
+	if len(items) == 0 {
+		items = append(items,
+			lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#4B5563")).
+				Italic(true).
+				Render("No tasks"),
+		)
 	}
-	style = style.BorderForeground(priority.Color())
 
-	return style.Render(content)
+	content := title + "\n" + strings.Repeat("─", 24) + "\n\n" +
+		strings.Join(items, "\n")
+
+	style := columnBase
+	if index == m.selectedCol {
+		style = selectedColumn
+	}
+
+	return style.BorderForeground(color).Render(content)
 }
 
-func (m model) renderTask(task Task, isSelected bool) string {
-	var b strings.Builder
-
+func (m model) renderTask(t *Task, selected bool) string {
 	checkbox := "☐"
-	if task.Completed {
+	if t.Completed {
 		checkbox = "☑"
 	}
 
-	title := task.Title
+	title := t.Title
 	if len(title) > 20 {
 		title = title[:17] + "..."
 	}
 
-	content := fmt.Sprintf("%s %s", checkbox, title)
-
-	style := taskCardStyle
-	if isSelected {
-		style = selectedTaskStyle
-	} else if task.Completed {
-		style = completedTaskStyle
+	labelText := ""
+	if len(t.Labels) > 0 {
+		labelText = "\n" + lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#9CA3AF")).
+			Render("#" + strings.Join(t.Labels, " #"))
 	}
 
-	b.WriteString(style.Width(22).Render(content))
+	content := fmt.Sprintf("%s %s%s", checkbox, title, labelText)
 
-	return b.String()
+	style := taskStyle
+	if selected {
+		style = selectedTask
+	} else if t.Completed {
+		style = completedTask
+	}
+
+	return style.Width(24).Render(content)
 }
 
-func (m model) viewAdd() string {
-	priorityName := Priority(m.selectedCol).String()
-	priorityColor := Priority(m.selectedCol).Color()
 
-	titleText := fmt.Sprintf("📝 ADD TASK TO %s", priorityName)
-	title := lipgloss.NewStyle().
-		Bold(true).
-		Foreground(priorityColor).
-		Render(titleText)
-
-	return fmt.Sprintf(
-		"%s\n\n%s\n\n%s",
-		title,
-		m.textarea.View(),
-		helpStyle.Render("ctrl+s to save • esc to cancel"),
-	)
+type model struct {
+	tasks        []Task
+	columns      []string
+	selectedCol  int
+	selectedTask int
+	mode         ViewMode
+	textarea     textarea.Model
+	editingTask  *Task
+	width        int
+	height       int
+	path         string
 }
 
-func (m model) viewEdit() string {
-	title := "✏️  EDIT TASK"
-	if m.editingTask != nil {
-		taskTitle := m.editingTask.Title
-		if len(taskTitle) > 40 {
-			taskTitle = taskTitle[:37] + "..."
+var columnStyle = lipgloss.NewStyle().
+	Border(lipgloss.RoundedBorder()).
+	Padding(1, 2).
+	Width(30).
+	Height(20)
+
+var selectedColumnStyle = columnStyle.Copy().
+	BorderForeground(lipgloss.Color("#FBBF24"))
+
+var selectedTaskStyle = lipgloss.NewStyle().
+	Border(lipgloss.ThickBorder()).
+	BorderForeground(lipgloss.Color("#FBBF24")).
+	Padding(0, 1)
+
+func defaultColumns() []string {
+	return []string{"todo", "doing", "done", "feature", "bug", "refactor"}
+}
+func getPath() string {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return ".basket.json"
+	}
+	return filepath.Join(cwd, ".basket.json")
+}
+
+func getLocalPath() string {
+	return getPath()
+}
+func load(path string) ([]Task, []string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return []Task{}, defaultColumns()
+	}
+
+	var t TaskList
+	if err := json.Unmarshal(data, &t); err != nil {
+		return []Task{}, defaultColumns()
+	}
+
+	if len(t.Config.Columns) == 0 {
+		t.Config.Columns = defaultColumns()
+	}
+
+	return t.Tasks, t.Config.Columns
+}
+
+func save(path string, tasks []Task, cols []string) {
+	data, _ := json.MarshalIndent(TaskList{
+		Tasks: tasks,
+		Config: BoardConfig{
+			Columns: cols,
+		},
+	}, "", "  ")
+
+	_ = os.WriteFile(path, data, 0644)
+}
+func initialModel() model {
+	ta := textarea.New()
+	ta.Placeholder = "New task..."
+	ta.Focus()
+	ta.SetWidth(50)
+	ta.SetHeight(3)
+	ta.CharLimit = 500
+
+	path := getPath()
+	tasks, cols := load(path)
+
+	return model{
+		tasks:   tasks,
+		columns: cols,
+		path:    path,
+		mode:    ViewBoard,
+		textarea: ta, // ✅ IMPORTANT
+	}
+}
+
+func (m model) Init() tea.Cmd { return nil }
+
+func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+
+	case tea.KeyMsg:
+		switch m.mode {
+
+		case ViewBoard:
+			switch msg.String() {
+
+			case "q":
+				return m, tea.Quit
+
+			case "h":
+				if m.selectedCol > 0 {
+					m.selectedCol--
+				}
+
+			case "l":
+				if m.selectedCol < len(m.columns)-1 {
+					m.selectedCol++
+				}
+
+			case "j":
+				m.selectedTask++
+
+			case "k":
+				if m.selectedTask > 0 {
+					m.selectedTask--
+				}
+
+			case "n":
+				m.mode = ViewAdd
+				return m, m.textarea.Focus()
+
+			case " ":
+				task := m.getSelectedTask()
+				if task != nil {
+					task.Completed = !task.Completed
+					m.save()
+				}
+
+			case "m":
+				task := m.getSelectedTask()
+				if task != nil {
+					idx := m.selectedCol + 1
+					if idx >= len(m.columns) {
+						idx = 0
+					}
+					task.Column = m.columns[idx]
+					m.save()
+				}
+
+			case "d":
+				m.deleteSelected()
+
+			case "e":
+				task := m.getSelectedTask()
+				if task != nil {
+					m.mode = ViewEdit
+					m.editingTask = task
+					m.textarea.SetValue(task.Description)
+					return m, m.textarea.Focus()
+				}
+			}
+
+		case ViewAdd:
+			switch msg.String() {
+			case "esc":
+				m.mode = ViewBoard
+			case "enter":
+				title := strings.TrimSpace(m.textarea.Value())
+				if title != "" {
+					m.tasks = append(m.tasks, Task{
+						ID:        fmt.Sprintf("%d", time.Now().UnixNano()),
+						Title:     title,
+						Column:    m.columns[m.selectedCol],
+						CreatedAt: time.Now(),
+					})
+					m.save()
+				}
+				m.textarea.Reset()
+				m.mode = ViewBoard
+			}
+			var cmd tea.Cmd
+			m.textarea, cmd = m.textarea.Update(msg)
+			return m, cmd
+
+		case ViewEdit:
+			switch msg.String() {
+			case "esc":
+				m.mode = ViewBoard
+			case "enter":
+				if m.editingTask != nil {
+					m.editingTask.Description = m.textarea.Value()
+					m.save()
+				}
+				m.mode = ViewBoard
+			}
+			var cmd tea.Cmd
+			m.textarea, cmd = m.textarea.Update(msg)
+			return m, cmd
 		}
-		title = fmt.Sprintf("✏️  %s", taskTitle)
 	}
-
-	styledTitle := lipgloss.NewStyle().
-		Bold(true).
-		Foreground(lipgloss.Color("#FBBF24")).
-		Render(title)
-
-	return fmt.Sprintf(
-		"%s\n\n%s\n\n%s",
-		styledTitle,
-		m.textarea.View(),
-		helpStyle.Render("ctrl+s to save • esc to cancel"),
-	)
+	return m, nil
 }
 
-func (m model) viewHelp() string {
-	help := `
-╔═══════════════════════════════════════╗
-║          🧺 BASKET HELP               ║
-╚═══════════════════════════════════════╝
+func (m *model) save() {
+	save(m.path, m.tasks, m.columns)
+}
 
-NAVIGATION
-  h/←  Move to left column
-  l/→  Move to right column  
-  k/↑  Move up in column
-  j/↓  Move down in column
+func (m *model) getTasks(col string) []*Task {
+	var out []*Task
+	for i := range m.tasks {
+		if m.tasks[i].Column == col {
+			out = append(out, &m.tasks[i])
+		}
+	}
+	return out
+}
 
-TASK ACTIONS
-  space    Toggle completion
-  m        Move task to next priority
-  n        Add new task
-  e        Edit task description
-  d        Delete task
+func (m *model) getSelectedTask() *Task {
+	col := m.columns[m.selectedCol]
+	tasks := m.getTasks(col)
+	if len(tasks) == 0 {
+		return nil
+	}
+	if m.selectedTask >= len(tasks) {
+		m.selectedTask = len(tasks) - 1
+	}
+	return tasks[m.selectedTask]
+}
 
-VIEW
-  t        Switch global/local
-  ?        Show this help
-  q        Quit
+func (m *model) deleteSelected() {
+	col := m.columns[m.selectedCol]
+	tasks := m.getTasks(col)
+	if len(tasks) == 0 {
+		return
+	}
+	id := tasks[m.selectedTask].ID
 
-STORAGE
-  Global   ~/basket-tasks.json
-  Local    ./.basket.json
-
-Priority columns from left to right:
-  LOWEST → LOW → MEDIUM → HIGH → HIGHEST
-
-Press ESC or q to return
-`
-	return help
+	for i := range m.tasks {
+		if m.tasks[i].ID == id {
+			m.tasks = append(m.tasks[:i], m.tasks[i+1:]...)
+			break
+		}
+	}
+	m.save()
 }
 
 func main() {
 	p := tea.NewProgram(initialModel(), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
-		fmt.Printf("Error: %v", err)
-		os.Exit(1)
+		panic(err)
 	}
 }
